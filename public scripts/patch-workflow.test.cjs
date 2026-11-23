@@ -1,0 +1,109 @@
+const test = require('node:test'),
+  assert = require('node:assert/strict'),
+  fs = require('node:fs'),
+  yaml = require('js-yaml'),
+  path = require('node:path');
+test('Actions publication is opt-in and depends on successful builds plus complete verification', () => {
+  const w = yaml.load(fs.readFileSync('.github/workflows/battly-updates.yml', 'utf8'));
+  assert.equal(w.on.workflow_dispatch.inputs.dry_run.default, true);
+  assert(w.on.push.branches.includes('main'));
+  assert(w.jobs.publish.if.includes("vars.BATTLY_RELEASE_PUBLISH_ENABLED == 'true'"));
+  assert(w.jobs.publish.needs.includes('verify'));
+  assert(w.jobs.publish.needs.includes('build'));
+  assert.equal(w.permissions.contents, 'read');
+  assert.equal(w.jobs.publish.permissions.contents, 'write');
+  assert.equal(w.jobs.build.strategy.matrix.include.length, 5);
+  assert.equal(w.jobs.flatpak.uses, './.github/workflows/flatpak.yml');
+  assert(w.jobs.verify.needs.includes('flatpak'));
+  assert(w.env.BATTLY_RELEASE_NOT_BEFORE.includes('vars.BATTLY_RELEASE_NOT_BEFORE'));
+  const keys = w.jobs.build.steps.find(
+    (s) => s.name === 'Prepare public configuration and signing key',
+  );
+  assert(keys.env.PATCH_PRIVATE_KEY.includes("needs.plan.outputs.type == 'patch'"));
+  const commands = w.jobs.build.steps
+    .filter((s) => s.run)
+    .map((s) => s.run)
+    .join('\n');
+  for (const check of [
+    'npm run lint',
+    'npm run typecheck',
+    'npm audit',
+    'npm run build',
+    'npm run patches:test',
+    'patch-electron-smoke.cjs',
+  ])
+    assert(commands.includes(check));
+  assert(commands.includes('BATTLY_PATCH_BASE_CONFIG_FILE'));
+  assert(commands.includes('SOURCE_DATE_EPOCH'));
+  const uploads = w.jobs.build.steps.find(
+    (s) =>
+      s.uses?.startsWith('actions/upload-artifact') &&
+      s.with?.name === 'update-${{ matrix.platform }}-${{ matrix.arch }}',
+  );
+  assert.equal(uploads.with.path, 'artifacts/patch-ci/github-assets/*');
+});
+test('only the canonical workflow automatically publishes a desktop release', () => {
+  const legacy = yaml.load(fs.readFileSync('.github/workflows/windows-release.yml', 'utf8'));
+  assert(!legacy.on.push && !legacy.on.release);
+  const flatpak = yaml.load(fs.readFileSync('.github/workflows/flatpak.yml', 'utf8'));
+  assert(Object.hasOwn(flatpak.on, 'workflow_call'));
+  assert(!flatpak.on.push);
+  assert.equal(flatpak.jobs.flatpak.environment, 'battly-updates-build');
+  const upload = flatpak.jobs.flatpak.steps.find((s) =>
+    s.uses?.startsWith('actions/upload-artifact'),
+  );
+  assert.equal(upload.with.name, 'update-flatpak-linux-x64');
+});
+test('installer trust anchors and private keys remain outside the patchable runtime tree', () => {
+  const source = fs.readFileSync('public scripts/build-patches.cjs', 'utf8');
+  assert(source.includes("'bootstrap/github-patch-feed.cjs'"));
+  assert(source.includes("files(path.join(root, 'dist'), 'dist/')"));
+  const prep = fs.readFileSync('public scripts/prepare-patch-ci.cjs', 'utf8');
+  assert(prep.includes('process.env.RUNNER_TEMP'));
+  assert(!prep.includes('console.log(secret)'));
+});
+
+test('CDN mirroring follows a successful patch publication and supports isolated retries', () => {
+  const yaml = require('js-yaml');
+  const workflow = yaml.load(
+    fs.readFileSync(path.join(__dirname, '../.github/workflows/battly-updates.yml'), 'utf8'),
+  );
+  const mirror = yaml.load(
+    fs.readFileSync(path.join(__dirname, '../.github/workflows/patch-cdn.yml'), 'utf8'),
+  );
+  assert.deepEqual(workflow.jobs['mirror-patch'].needs, ['plan', 'publish']);
+  assert.match(workflow.jobs['mirror-patch'].if, /type == 'patch'/);
+  assert.match(workflow.jobs['mirror-patch'].if, /publish.result == 'success'/);
+  assert(mirror.on.workflow_dispatch);
+  assert(!mirror.on.workflow_call);
+  assert.equal(workflow.jobs['mirror-patch'].environment, 'battly-updates');
+  assert.equal(workflow.jobs['mirror-patch'].uses, undefined);
+  assert.match(workflow.jobs['mirror-patch'].if, /outputs.published == 'true'/);
+  assert.equal(workflow.jobs.plan.outputs.published, '${{ steps.plan.outputs.published }}');
+  assert.match(
+    workflow.jobs['mirror-patch'].steps.at(-1).env.WASABI_SECRET,
+    /secrets\.BATTLY_CDN_SECRET/,
+  );
+  assert.equal(mirror.jobs.mirror.environment, 'battly-updates');
+  assert.equal(mirror.jobs.mirror.concurrency['cancel-in-progress'], false);
+  assert.equal(mirror.permissions.contents, 'read');
+  const step = mirror.jobs.mirror.steps.at(-1);
+  assert.equal(step.env.PATCH_TAG, '${{ inputs.tag }}');
+  assert.match(step.run, /"\$PATCH_TAG"/);
+  assert.match(step.env.WASABI_SECRET, /secrets\.BATTLY_CDN_SECRET/);
+});
+
+test('macOS ARM patch sources can use Intel macOS while full installers retain native runners', () => {
+  const workflow = yaml.load(fs.readFileSync('.github/workflows/battly-updates.yml', 'utf8'));
+  const runner = workflow.jobs.build['runs-on'];
+  assert.match(runner, /type == 'patch'/);
+  assert.match(runner, /platform == 'darwin'/);
+  assert.match(runner, /arch == 'arm64'/);
+  assert.match(runner, /macos-15-intel/);
+  assert.match(runner, /\|\| matrix.runner/);
+  assert(
+    workflow.jobs.build.strategy.matrix.include.some(
+      (row) => row.platform === 'darwin' && row.arch === 'arm64' && row.runner === 'macos-15',
+    ),
+  );
+});
